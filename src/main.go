@@ -17,6 +17,14 @@ import (
 // 初始化随机数生成器（兼容 Go 1.16+）
 var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
+// packetData 存储数据包的原始信息和修改后的信息
+type packetData struct {
+	originalData []byte               // 原始字节数据（未修改时直接写入）
+	captureInfo  gopacket.CaptureInfo // 抓包元信息
+	modified     bool                 // 是否被修改
+	modifiedData []byte               // 修改后的字节数据（修改时写入）
+}
+
 // generateRandomIP 生成合法的随机单播IPv4地址（排除特殊地址段）
 func generateRandomIP() net.IP {
 	for {
@@ -62,11 +70,11 @@ func generateRandomIPv6() net.IP {
 
 		// 排除特殊地址段（不依赖废弃方法）
 		switch {
-		case ip.IsMulticast():         // 组播地址（ff00::/8）
+		case ip.IsMulticast(): // 组播地址（ff00::/8）
 			continue
-		case ip.IsLoopback():          // 环回地址（::1/128）
+		case ip.IsLoopback(): // 环回地址（::1/128）
 			continue
-		case ip.IsLinkLocalUnicast():  // 链路本地地址（fe80::/10）
+		case ip.IsLinkLocalUnicast(): // 链路本地地址（fe80::/10）
 			continue
 		case ip[0] == 0xfe && ip[1] == 0xc0: // 站点本地地址（fec0::/10，已弃用）
 			continue
@@ -174,47 +182,56 @@ func generateIPMap(pairCount map[ipPair]int, proto string) map[string]net.IP {
 	}
 }
 
-// readPCAP 读取PCAP文件，返回所有数据包和链路层类型
-func readPCAP(filePath string) ([]gopacket.Packet, layers.LinkType, error) {
+// readPCAP 读取PCAP文件，返回解析后的数据包、原始字节数据、链路层类型
+func readPCAP(filePath string) ([]gopacket.Packet, []packetData, layers.LinkType, error) {
 	// 使用 pcapgo 读取PCAP（纯Go，无C依赖）
 	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, layers.LinkTypeEthernet, fmt.Errorf("open pcap file failed: %w", err)
+		return nil, nil, layers.LinkTypeEthernet, fmt.Errorf("open pcap file failed: %w", err)
 	}
 	defer f.Close()
 
 	// 自动检测PCAP格式（支持pcap和pcapng）
 	reader, err := pcapgo.NewReader(f)
 	if err != nil {
-		return nil, layers.LinkTypeEthernet, fmt.Errorf("create pcap reader failed: %w", err)
+		return nil, nil, layers.LinkTypeEthernet, fmt.Errorf("create pcap reader failed: %w", err)
 	}
 
 	// 获取链路层类型
 	linkType := layers.LinkType(reader.LinkType())
 
 	var packets []gopacket.Packet
+	var packetDatas []packetData
+
 	for {
-		// 读取单个数据包
-		data, ci, err := reader.ReadPacketData()
+		// 读取单个数据包的原始字节和元信息
+		originalData, ci, err := reader.ReadPacketData()
 		if err != nil {
 			break // 读取完毕或出错
 		}
 
-		// 解析数据包
+		// 解析数据包（强制解码所有层）
 		pkt := gopacket.NewPacket(
-			data,
+			originalData,
 			linkType,
-			gopacket.DecodeOptions{NoCopy: true},
+			gopacket.DecodeOptions{NoCopy: true, Lazy: false, SkipDecodeRecovery: true},
 		)
-		pkt.Metadata().CaptureInfo = ci
+
+		// 存储原始数据和元信息
+		packetDatas = append(packetDatas, packetData{
+			originalData: originalData,
+			captureInfo:  ci,
+			modified:     false, // 初始为未修改
+		})
+
 		packets = append(packets, pkt)
 	}
 
-	return packets, linkType, nil
+	return packets, packetDatas, linkType, nil
 }
 
-// writePCAP 将修改后的数据包写入PCAP文件（纯Go实现，无C依赖）
-func writePCAP(filePath string, packets []gopacket.Packet, linkType layers.LinkType) error {
+// writePCAP 写入PCAP文件（区分修改包和原始包）
+func writePCAP(filePath string, packetDatas []packetData, linkType layers.LinkType) error {
 	// 创建输出目录
 	outputDir := filepath.Dir(filePath)
 	if outputDir != "" {
@@ -232,44 +249,33 @@ func writePCAP(filePath string, packets []gopacket.Packet, linkType layers.LinkT
 
 	// 创建PCAP写入器（纯Go，支持pcap格式）
 	writer := pcapgo.NewWriter(f)
-	// 修复：移除 uint32() 强制转换，直接传递 linkType（layers.LinkType 类型匹配）
 	if err := writer.WriteFileHeader(65535, linkType); err != nil {
 		return fmt.Errorf("write pcap header failed: %w", err)
 	}
 
-	// 序列化并写入所有数据包
-	serializeOpts := gopacket.SerializeOptions{
-		FixLengths:       true,
-		ComputeChecksums: true,
-	}
-
-	for _, pkt := range packets {
-		buf := gopacket.NewSerializeBuffer()
-		// 转换为可序列化层
-		var serializableLayers []gopacket.SerializableLayer
-		for _, layer := range pkt.Layers() {
-			if sl, ok := layer.(gopacket.SerializableLayer); ok {
-				serializableLayers = append(serializableLayers, sl)
+	// 遍历所有数据包，分别处理
+	for _, pd := range packetDatas {
+		if pd.modified {
+			// 处理修改后的数据包：写入修改后的字节
+			if err := writer.WritePacket(pd.captureInfo, pd.modifiedData); err != nil {
+				return fmt.Errorf("write modified packet failed: %w", err)
 			}
-		}
-		// 序列化数据包
-		if err := gopacket.SerializeLayers(buf, serializeOpts, serializableLayers...); err != nil {
-			return fmt.Errorf("serialize packet failed: %w", err)
-		}
-		// 写入数据包（保留抓包元信息）
-		if err := writer.WritePacket(pkt.Metadata().CaptureInfo, buf.Bytes()); err != nil {
-			return fmt.Errorf("write packet failed: %w", err)
+		} else {
+			// 处理未修改的原始数据包：直接写入原始字节（保留原始校验和）
+			if err := writer.WritePacket(pd.captureInfo, pd.originalData); err != nil {
+				return fmt.Errorf("write original packet failed: %w", err)
+			}
 		}
 	}
 
 	return nil
 }
 
-// processPCAP 核心处理逻辑：读取PCAP、分析映射、修改数据包、写入输出
+// 读取PCAP、分析映射、修改数据包、写入输出
 func processPCAP(inputPath, outputPath string) error {
-	// 1. 读取原始PCAP
+	// 1. 读取原始PCAP（获取解析后的数据包和原始字节数据）
 	fmt.Printf("\nProcessing %s:\n", filepath.Base(inputPath))
-	packets, linkType, err := readPCAP(inputPath)
+	packets, packetDatas, linkType, err := readPCAP(inputPath)
 	if err != nil {
 		return fmt.Errorf("read pcap error: %w", err)
 	}
@@ -295,25 +301,55 @@ func processPCAP(inputPath, outputPath string) error {
 		}
 	}
 
-	// 3. 修改所有数据包
-	var modifiedPackets []gopacket.Packet
+	// 3. 修改所有需要处理的数据包
 	ip4Count, ip6Count := 0, 0
+	serializeOpts := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}
 
-	for _, pkt := range packets {
-		var newLayers []gopacket.SerializableLayer
-		ipModified := false
+	for pktIdx, pkt := range packets {
+		var (
+			newLayers   []gopacket.SerializableLayer
+			ipModified  = false
+			ipv4Layer   *layers.IPv4 // 显式存储IPv4层
+			ipv6Layer   *layers.IPv6 // 显式存储IPv6层
+			linkLayer   gopacket.SerializableLayer
+			tcpLayers   []*layers.TCP                // 存储TCP层
+			udpLayers   []*layers.UDP                // 存储UDP层
+			otherLayers []gopacket.SerializableLayer // 其他层
+		)
 
-		// 保留原始链路层
-		if linkLayer := pkt.LinkLayer(); linkLayer != nil {
-			if sl, ok := linkLayer.(gopacket.SerializableLayer); ok {
-				newLayers = append(newLayers, sl)
+		// 第一步：提取原始包中的所有层（按类型分类）
+		for _, layer := range pkt.Layers() {
+			switch l := layer.(type) {
+			case gopacket.LinkLayer: // 链路层（Ethernet等）
+				if sl, ok := l.(gopacket.SerializableLayer); ok {
+					linkLayer = sl
+				}
+			case *layers.IPv4: // IPv4层
+				ipv4Layer = l
+			case *layers.IPv6: // IPv6层
+				ipv6Layer = l
+			case *layers.TCP: // TCP层
+				tcpLayers = append(tcpLayers, l)
+			case *layers.UDP: // UDP层
+				udpLayers = append(udpLayers, l)
+			default: // 其他层（应用层等）
+				if sl, ok := l.(gopacket.SerializableLayer); ok {
+					otherLayers = append(otherLayers, sl)
+				}
 			}
 		}
 
-		// 处理IPv4数据包
-		if ip4Layer := pkt.Layer(layers.LayerTypeIPv4); ip4Layer != nil && ipv4Map != nil {
-			origIP4 := ip4Layer.(*layers.IPv4)
-			// 复制IPv4层字段（Id 大小写正确）
+		// 第二步：添加链路层（保持不变）
+		if linkLayer != nil {
+			newLayers = append(newLayers, linkLayer)
+		}
+
+		// 第三步：处理IPv4层（修改IP）
+		if ipv4Layer != nil && ipv4Map != nil {
+			origIP4 := ipv4Layer
 			newIP4 := &layers.IPv4{
 				Version:    origIP4.Version,
 				IHL:        origIP4.IHL,
@@ -324,12 +360,12 @@ func processPCAP(inputPath, outputPath string) error {
 				FragOffset: origIP4.FragOffset,
 				TTL:        origIP4.TTL,
 				Protocol:   origIP4.Protocol,
-				Checksum:   0, // 自动计算
+				Checksum:   0,
 				SrcIP:      origIP4.SrcIP,
 				DstIP:      origIP4.DstIP,
 				Options:    origIP4.Options,
 			}
-			// 应用IPv4映射
+			// 应用IP映射
 			if newSrc, ok := ipv4Map[origIP4.SrcIP.String()]; ok {
 				newIP4.SrcIP = newSrc
 			}
@@ -341,21 +377,20 @@ func processPCAP(inputPath, outputPath string) error {
 			ipModified = true
 		}
 
-		// 处理IPv6数据包
-		if ip6Layer := pkt.Layer(layers.LayerTypeIPv6); ip6Layer != nil && ipv6Map != nil {
-			origIP6 := ip6Layer.(*layers.IPv6)
-			// 复制IPv6层字段
+		// 第四步：处理IPv6层（修改IP）
+		if ipv6Layer != nil && ipv6Map != nil {
+			origIP6 := ipv6Layer
 			newIP6 := &layers.IPv6{
-				Version:     origIP6.Version,
+				Version:      origIP6.Version,
 				TrafficClass: origIP6.TrafficClass,
-				FlowLabel:   origIP6.FlowLabel,
-				Length:      origIP6.Length,
-				NextHeader:  origIP6.NextHeader,
-				HopLimit:    origIP6.HopLimit,
-				SrcIP:       origIP6.SrcIP,
-				DstIP:       origIP6.DstIP,
+				FlowLabel:    origIP6.FlowLabel,
+				Length:       origIP6.Length,
+				NextHeader:   origIP6.NextHeader,
+				HopLimit:     origIP6.HopLimit,
+				SrcIP:        origIP6.SrcIP,
+				DstIP:        origIP6.DstIP,
 			}
-			// 应用IPv6映射
+			// 应用IP映射
 			if newSrc, ok := ipv6Map[origIP6.SrcIP.String()]; ok {
 				newIP6.SrcIP = newSrc
 			}
@@ -367,49 +402,52 @@ func processPCAP(inputPath, outputPath string) error {
 			ipModified = true
 		}
 
-		// 添加后续层（传输层/应用层）
-		for _, layer := range pkt.Layers() {
-			layerType := layer.LayerType()
-			if layerType == layers.LayerTypeIPv4 || layerType == layers.LayerTypeIPv6 {
-				continue // 已处理IP层
-			}
-			// 重置TCP/UDP校验和
-			switch l := layer.(type) {
-			case *layers.TCP:
-				newTCP := *l
-				newTCP.Checksum = 0
-				newLayers = append(newLayers, &newTCP)
-			case *layers.UDP:
-				newUDP := *l
-				newUDP.Checksum = 0
-				newLayers = append(newLayers, &newUDP)
+		// 第五步：处理TCP层（绑定网络层）
+		for _, origTCP := range tcpLayers {
+			newTCP := *origTCP
+			newTCP.Checksum = 0
+
+			// 显式绑定具体的网络层
+			switch {
+			case ipv4Layer != nil && ipv4Map != nil:
+				newTCP.SetNetworkLayerForChecksum(newLayers[len(newLayers)-1].(*layers.IPv4))
+			case ipv6Layer != nil && ipv6Map != nil:
+				newTCP.SetNetworkLayerForChecksum(newLayers[len(newLayers)-1].(*layers.IPv6))
 			default:
-				if sl, ok := layer.(gopacket.SerializableLayer); ok {
-					newLayers = append(newLayers, sl)
-				}
+				return fmt.Errorf("packet %d: TCP layer has no valid network layer", pktIdx)
 			}
+			newLayers = append(newLayers, &newTCP)
 		}
 
-		// 构建新数据包
+		// 第六步：处理UDP层（绑定网络层）
+		for _, origUDP := range udpLayers {
+			newUDP := *origUDP
+			newUDP.Checksum = 0
+
+			// 显式绑定具体的网络层
+			switch {
+			case ipv4Layer != nil && ipv4Map != nil:
+				newUDP.SetNetworkLayerForChecksum(newLayers[len(newLayers)-1].(*layers.IPv4))
+			case ipv6Layer != nil && ipv6Map != nil:
+				newUDP.SetNetworkLayerForChecksum(newLayers[len(newLayers)-1].(*layers.IPv6))
+			default:
+				return fmt.Errorf("packet %d: UDP layer has no valid network layer", pktIdx)
+			}
+			newLayers = append(newLayers, &newUDP)
+		}
+
+		// 第七步：添加其他层
+		newLayers = append(newLayers, otherLayers...)
+
+		// 第八步：序列化修改后的数据包，更新packetData
 		if ipModified {
 			buf := gopacket.NewSerializeBuffer()
-			serializeOpts := gopacket.SerializeOptions{
-				FixLengths:       true,
-				ComputeChecksums: true,
-			}
 			if err := gopacket.SerializeLayers(buf, serializeOpts, newLayers...); err != nil {
-				return fmt.Errorf("serialize modified packet failed: %w", err)
+				return fmt.Errorf("packet %d: serialize modified packet failed: %w", pktIdx, err)
 			}
-			// 创建新数据包（保留元信息）
-			newPkt := gopacket.NewPacket(
-				buf.Bytes(),
-				linkType,
-				gopacket.DecodeOptions{NoCopy: true},
-			)
-			newPkt.Metadata().CaptureInfo = pkt.Metadata().CaptureInfo
-			modifiedPackets = append(modifiedPackets, newPkt)
-		} else {
-			modifiedPackets = append(modifiedPackets, pkt)
+			// 标记为修改，并存储修改后的字节数据
+			packetDatas[pktIdx].modified = true
+			packetDatas[pktIdx].modifiedData = buf.Bytes()
 		}
 	}
 
@@ -417,12 +455,13 @@ func processPCAP(inputPath, outputPath string) error {
 	if ipv4Map == nil && ipv6Map == nil {
 		fmt.Println("  No IPv4/IPv6 traffic found. Copying file without modification.")
 	}
-	if err := writePCAP(outputPath, modifiedPackets, linkType); err != nil {
+	if err := writePCAP(outputPath, packetDatas, linkType); err != nil {
 		return fmt.Errorf("write modified pcap failed: %w", err)
 	}
 
 	// 打印统计信息
-	fmt.Printf("Modified %d packets (IPv4: %d, IPv6: %d)\n", len(modifiedPackets), ip4Count, ip6Count)
+	totalModified := ip4Count + ip6Count
+	fmt.Printf("Modified %d packets (IPv4: %d, IPv6: %d)\n", totalModified, ip4Count, ip6Count)
 	fmt.Printf("Output saved to: %s\n", outputPath)
 	return nil
 }
